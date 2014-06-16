@@ -1,0 +1,372 @@
+diff --git a/.gitignore b/.gitignore
+index a855ccd..788b4b4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -43,4 +43,6 @@ libratbox/src/version.c.last
+ configure.ac
+ run
+ services
+-
++*/Makefile
++*/*/Makefile
++*/*/*/Makefile
+diff --git a/include/listener.h b/include/listener.h
+index 8a37db9..aab9958 100644
+--- a/include/listener.h
++++ b/include/listener.h
+@@ -42,6 +42,7 @@ struct Listener
+ 	struct rb_sockaddr_storage addr;
+ 	struct DNSQuery *dns_query;
+ 	char vhost[HOSTLEN + 1];	/* virtual name of listener */
++	int protonum; /* TCP/SCTP */
+ };
+ 
+ extern void add_listener(int port, const char *vaddr_ip, int family, int ssl, int defer_accept);
+diff --git a/include/s_newconf.h b/include/s_newconf.h
+index dde364d..c7082a6 100644
+--- a/include/s_newconf.h
++++ b/include/s_newconf.h
+@@ -208,6 +208,7 @@ struct server_conf
+ #define SERVER_TB		0x0010
+ #define SERVER_AUTOCONN		0x0020
+ #define SERVER_SSL		0x0040
++#define SERVER_SCTP		0x0080
+ 
+ #define ServerConfIllegal(x)	((x)->flags & SERVER_ILLEGAL)
+ #define ServerConfVhosted(x)	((x)->flags & SERVER_VHOSTED)
+@@ -216,6 +217,7 @@ struct server_conf
+ #define ServerConfTb(x)		((x)->flags & SERVER_TB)
+ #define ServerConfAutoconn(x)	((x)->flags & SERVER_AUTOCONN)
+ #define ServerConfSSL(x)	((x)->flags & SERVER_SSL)
++#define ServerConfSCTP(x)	((x)->flags & SERVER_SCTP)
+ 
+ extern struct server_conf *make_server_conf(void);
+ extern void free_server_conf(struct server_conf *);
+diff --git a/libratbox/src/find.save b/libratbox/src/find.save
+new file mode 100644
+index 0000000..139597f
+--- /dev/null
++++ b/libratbox/src/find.save
+@@ -0,0 +1,2 @@
++
++
+diff --git a/src/listener.c b/src/listener.c
+index a781f60..009ea57 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -164,7 +164,7 @@ show_ports(struct Client *source_p)
+ #endif
+ 
+ static int
+-inetport(struct Listener *listener)
++inetport_tcp(struct Listener *listener)
+ {
+ 	rb_fde_t *F;
+ 	int opt = 1;
+@@ -172,8 +172,90 @@ inetport(struct Listener *listener)
+ 	/*
+ 	 * At first, open a new socket
+ 	 */
+-	
+-	F = rb_socket(GET_SS_FAMILY(&listener->addr), SOCK_STREAM, 0, "Listener socket");
++	// Uhh. this means we can't listen for TCP connections. *shriek*
++	// Better idea: fix add_listener
++	F = rb_socket(GET_SS_FAMILY(&listener->addr), SOCK_STREAM, IPPROTO_TCP, "Listener socket");
++
++#ifdef RB_IPV6
++	if(listener->addr.ss_family == AF_INET6)
++	{
++		struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&listener->addr;
++		if(!IN6_ARE_ADDR_EQUAL(&in6->sin6_addr, &in6addr_any))
++		{
++			rb_inet_ntop(AF_INET6, &in6->sin6_addr, listener->vhost, sizeof(listener->vhost));
++			listener->name = listener->vhost;
++		}
++	} else
++#endif
++	{
++		struct sockaddr_in *in = (struct sockaddr_in *)&listener->addr;
++		if(in->sin_addr.s_addr != INADDR_ANY)
++		{
++			rb_inet_ntop(AF_INET, &in->sin_addr, listener->vhost, sizeof(listener->vhost));
++			listener->name = listener->vhost;
++		}	
++	}
++
++	if(F == NULL)
++	{
++		ilog_error("opening listener socket");
++		return 0;
++	}
++	else if((maxconnections - 10) < rb_get_fd(F)) /* XXX this is kinda bogus*/
++	{
++		ilog_error("no more connections left for listener");
++		rb_close(F);
++		return 0;
++	}
++
++	/*
++	 * XXX - we don't want to do all this crap for a listener
++	 * set_sock_opts(listener);
++	 */
++	if(setsockopt(rb_get_fd(F), SOL_SOCKET, SO_REUSEADDR, (char *) &opt, sizeof(opt)))
++	{
++		ilog_error("setting SO_REUSEADDR for listener");
++		rb_close(F);
++		return 0;
++	}
++
++	/*
++	 * Bind a port to listen for new connections if port is non-null,
++	 * else assume it is already open and try get something from it.
++	 */
++
++	if(bind(rb_get_fd(F), (struct sockaddr *) &listener->addr, GET_SS_LEN(&listener->addr)))
++	{
++		ilog_error("binding listener socket");
++		rb_close(F);
++		return 0;
++	}
++
++	if(rb_listen(F, RATBOX_SOMAXCONN, listener->defer_accept))
++	{
++		ilog_error("listen()");
++		rb_close(F);
++		return 0;
++	}
++
++	listener->F = F;
++
++	rb_accept_tcp(listener->F, accept_precallback, accept_callback, listener);
++	return 1;
++}
++
++static int
++inetport_sctp(struct Listener *listener)
++{
++	rb_fde_t *F;
++	int opt = 1;
++
++	/*
++	 * At first, open a new socket
++	 */
++	// Uhh. this means we can't listen for TCP connections. *shriek*
++	// Better idea: fix add_listener or the config.
++	F = rb_socket(GET_SS_FAMILY(&listener->addr), SOCK_STREAM, IPPROTO_SCTP, "Listener socket");
+ 
+ #ifdef RB_IPV6
+ 	if(listener->addr.ss_family == AF_INET6)
+@@ -377,8 +459,95 @@ add_listener(int port, const char *vhost_ip, int family, int ssl, int defer_acce
+ 	listener->F = NULL;
+ 	listener->ssl = ssl;
+ 	listener->defer_accept = defer_accept;
++	struct Listener *slistener;
++	slistener = listener;
++	if(inetport_tcp(listener))
++		listener->active = 1;
++	else
++		close_listener(listener);
++	if(inetport_sctp(slistener))
++		slistener->active = 1;
++	else
++		close_listener(slistener);
++}
++
++void
++add_sctp_listener(int port, const char *vhost_ip, int family, int ssl, int defer_accept)
++{
++	struct Listener *listener;
++	struct rb_sockaddr_storage vaddr;
++
++	/*
++	 * if no port in conf line, don't bother
++	 */
++	if(port == 0)
++		return;
++	memset(&vaddr, 0, sizeof(vaddr));
++	vaddr.ss_family = family;
++
++	if(vhost_ip != NULL)
++	{
++		if(family == AF_INET)
++		{
++			if(rb_inet_pton(family, vhost_ip, &((struct sockaddr_in *)&vaddr)->sin_addr) <= 0)
++				return;
++		} 
++#ifdef RB_IPV6
++		else
++		{
++			if(rb_inet_pton(family, vhost_ip, &((struct sockaddr_in6 *)&vaddr)->sin6_addr) <= 0)
++				return;
++		
++		}
++#endif
++	} else
++	{
++		switch(family)
++		{
++			case AF_INET:
++				((struct sockaddr_in *)&vaddr)->sin_addr.s_addr = INADDR_ANY;
++				break;
++#ifdef RB_IPV6
++			case AF_INET6:
++				memcpy(&((struct sockaddr_in6 *)&vaddr)->sin6_addr, &in6addr_any, sizeof(struct in6_addr));
++				break;
++			default:
++				return;
++#endif
++		} 
++	}
++	switch(family)
++	{
++		case AF_INET:
++			SET_SS_LEN(&vaddr, sizeof(struct sockaddr_in));
++			((struct sockaddr_in *)&vaddr)->sin_port = htons(port);
++			break;
++#ifdef RB_IPV6
++		case AF_INET6:
++			SET_SS_LEN(&vaddr, sizeof(struct sockaddr_in6));
++			((struct sockaddr_in6 *)&vaddr)->sin6_port = htons(port);
++			break;
++#endif
++		default:
++			break;
++	}
++	if((listener = find_listener(&vaddr)))
++	{
++		if(listener->F != NULL)
++			return;
++	}
++	else
++	{
++		listener = make_listener(&vaddr);
++		listener->next = ListenerPollList;
++		ListenerPollList = listener;
++	}
++
++	listener->F = NULL;
++	listener->ssl = ssl;
++	listener->defer_accept = defer_accept;
+ 
+-	if(inetport(listener))
++	if(inetport_sctp(listener))
+ 		listener->active = 1;
+ 	else
+ 		close_listener(listener);
+diff --git a/src/newconf.c b/src/newconf.c
+index cf31f7a..72c5267 100644
+--- a/src/newconf.c
++++ b/src/newconf.c
+@@ -346,6 +346,7 @@ static struct mode_table connect_table[] = {
+ 	{ "encrypted",	SERVER_ENCRYPTED	},
+ 	{ "topicburst",	SERVER_TB		},
+ 	{ "ssl",	SERVER_SSL		},
++	{ "sctp",	SERVER_SCTP		},
+ 	{ NULL,		0			},
+ };
+ 
+@@ -919,6 +920,41 @@ conf_set_listen_port_both(void *data, int ssl)
+ }
+ 
+ static void
++conf_set_listen_port_sctp_both(void *data, int ssl)
++{
++	conf_parm_t *args = data;
++	for (; args; args = args->next)
++	{
++		if((args->type & CF_MTYPE) != CF_INT)
++		{
++			conf_report_error
++				("listener::sctpport argument is not an integer " "-- ignoring.");
++			continue;
++		}
++                if(listener_address == NULL)
++                {
++			add_sctp_listener(args->v.number, listener_address, AF_INET, ssl, yy_defer_accept);
++#ifdef RB_IPV6
++			add_sctp_listener(args->v.number, listener_address, AF_INET6, ssl, yy_defer_accept);
++#endif
++                }
++		else
++                {
++			int family;
++#ifdef RB_IPV6
++			if(strchr(listener_address, ':') != NULL)
++				family = AF_INET6;
++			else 
++#endif
++				family = AF_INET;
++		
++			add_sctp_listener(args->v.number, listener_address, family, ssl, yy_defer_accept);
++                
++                }
++	}
++}
++
++static void
+ conf_set_listen_port(void *data)
+ {
+ 	conf_set_listen_port_both(data, 0);
+@@ -931,6 +967,18 @@ conf_set_listen_sslport(void *data)
+ }
+ 
+ static void
++conf_set_listen_sctpport(void *data)
++{
++	conf_set_listen_port_sctp_both(data, 0);
++}
++
++static void
++conf_set_listen_sctpsslport(void *data)
++{
++	conf_set_listen_port_sctp_both(data, 1);
++}
++
++static void
+ conf_set_listen_address(void *data)
+ {
+ 	rb_free(listener_address);
+@@ -2401,6 +2449,8 @@ newconf_init()
+ 	add_conf_item("listen", "defer_accept", CF_YESNO, conf_set_listen_defer_accept);
+ 	add_conf_item("listen", "port", CF_INT | CF_FLIST, conf_set_listen_port);
+ 	add_conf_item("listen", "sslport", CF_INT | CF_FLIST, conf_set_listen_sslport);
++	add_conf_item("listen", "sctpport", CF_INT | CF_FLIST, conf_set_listen_sctpport);
++	add_conf_item("listen", "sctpsslport", CF_INT | CF_FLIST, conf_set_listen_sctpsslport);
+ 	add_conf_item("listen", "ip", CF_QSTRING, conf_set_listen_address);
+ 	add_conf_item("listen", "host", CF_QSTRING, conf_set_listen_address);
+ 
+diff --git a/src/s_serv.c b/src/s_serv.c
+index e4576c6..3ef0639 100644
+--- a/src/s_serv.c
++++ b/src/s_serv.c
+@@ -1149,7 +1149,7 @@ serv_connect(struct server_conf *server_p, struct Client *by)
+ 	}
+ 
+ 	/* create a socket for the server connection */
+-	if((F = rb_socket(server_p->aftype, SOCK_STREAM, 0, NULL)) == NULL)
++	if((F = rb_socket(server_p->aftype, SOCK_STREAM, (server_p->flags & SERVER_SCTP)?IPPROTO_SCTP:IPPROTO_TCP, NULL)) == NULL)
+ 	{
+ 		ilog_error("opening a stream socket");
+ 		return 0;
+diff --git a/unsupported/Makefile b/unsupported/Makefile
+index 855cf41..67ba4b0 100644
+--- a/unsupported/Makefile
++++ b/unsupported/Makefile
+@@ -8,7 +8,7 @@ RM		= /bin/rm
+ SED             = /bin/sed
+ LEX		= flex
+ LEXLIB		= -lfl
+-CFLAGS		=  -O0 -Wall -std=gnu99 -g -g -O2  -DIRCD_PREFIX=\"/home/ronsorinc/hIRCd/run\"
++CFLAGS		=  -O0 -Wall -std=gnu99 -g -g -O2  -DIRCD_PREFIX=\"/home/jaffacake/hIRCd/run\"
+ PICFLAGS	= -fPIC -DPIC -shared
+ MKDEP		= gcc -MM
+ INSTALL		= /usr/bin/install -c
+@@ -16,7 +16,7 @@ INSTALL_PROGRAM	= ${INSTALL}
+ INSTALL_DATA	= ${INSTALL} -m 644
+ INSTALL_SUID    = ${INSTALL} -o root -m 4755
+ SHELL		= /bin/sh
+-AUTOMODULEDIR	= /home/ronsorinc/hIRCd/run/modules/unsupported
++AUTOMODULEDIR	= /home/jaffacake/hIRCd/run/modules/unsupported
+ 
+ SSL_LIBS	=  -lcrypto
+ SSL_INCLUDES	= 
